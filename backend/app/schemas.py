@@ -29,3 +29,19 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class PeriodComparePayload(BaseModel):
+    """跨期收入对照入参：授权主体、两期和可选的查询模板/数据域。"""
+
+    principal: str = "分析师A"
+    period_a: str = "2026Q3"
+    period_b: str = "2026Q4"
+    template_id: int | None = None
+    data_sources: list[str] = Field(default_factory=list)
+
+
+class SharePayload(BaseModel):
+    """共享报表查看者。"""
+
+    viewer: str

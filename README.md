@@ -77,5 +77,39 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 切片查询的跨期区域收入对照
+
+切片查询页（`/slice_query`）底部多了一块“跨期区域收入对照”，把相邻两期的区域收入
+放到同一口径下比较。核心约束是**只汇总当期实际有授权的区域**，因此两期的参与分区
+可以不同，报表必须把这件事讲清楚。
+
+- 授权来源：`app/services/olap_scope.py` 的 `resolve_period_grants` 按规则的
+  `生效时间/失效时间` 做期间切片，因此已冻结的历史规则（如 2026Q3 的季度授权）
+  仍然计入当时可读区域；规则当前状态只影响“还能不能继续授权”。
+- 区域口径：`地区 in (...)` 与 `城市 in (...)` 都会折算到区域；无区域条件且
+  `可见字段=全部` 的规则视为全区域授权。
+- 可比口径：两期都能读的区域才进入 `comparable_revenue`；本期新增归属的区域
+  （示例中的西南只读）进入 `new_region_revenue` 单列，不混入收入变动。
+- 参与分区：每期返回 `participating_regions / excluded_regions`，并为每个区域
+  带上 `access_level / reason / rule_ids / rule_names`，报表直接标注“为什么纳入”。
+- 只读：只读区域只给区域汇总，不展开城市明细（`region_detail` 不含该区域）。
+- 留档与共享：生成结果按 `comparison_id` 深拷贝留档，`GET .../{id}` 回查的是
+  生成当时的授权快照，不受后续授权变更影响；`.../{id}/grants` 列出该分析员的
+  全部历史授权区间。`POST .../{id}/share` 按查看者的**实时**授权逐区域裁剪，
+  未授权区域连区域名都不下发，只读区域同样不展开明细。
+
+接口（`backend/app/routers/resource.py`，注册在 `/{module}/{entry_id}` 之前）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/slice_query/period-compare` | 生成对照，入参 `principal/period_a/period_b/template_id` |
+| GET | `/api/slice_query/period-compare` | 列出留档，可按 `principal` 过滤 |
+| GET | `/api/slice_query/period-compare/{id}` | 回查历史快照 |
+| GET | `/api/slice_query/period-compare/{id}/grants` | 历史授权区间 |
+| POST | `/api/slice_query/period-compare/{id}/share` | 生成受限共享视图 |
+
+区域收入示例数据在 `backend/app/revenue_facts.py`，测试在
+`backend/tests/test_period_compare.py`（`cd backend && .venv/bin/python -m unittest discover -s tests`）。
+
 领域：数据工程
 子方向：数据分析与数据应用

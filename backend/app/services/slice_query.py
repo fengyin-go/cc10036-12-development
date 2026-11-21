@@ -1,10 +1,12 @@
-"""切片查询领域服务：多维立方消费，按维度切片、过滤和排序。"""
+"""切片查询领域服务：多维立方消费，按维度切片、过滤和排序，跨期收入对照。"""
 from __future__ import annotations
 
 from typing import Any
 
 from app.services.base import BaseModuleService
 from app.store import store
+from app import period_compare
+from app.revenue_facts import DEFAULT_DATA_SOURCES
 
 
 class SliceQueryService(BaseModuleService):
@@ -86,6 +88,100 @@ class SliceQueryService(BaseModuleService):
             if row.get("数据立方") == cube_name and row.get("status") == "已发布"
         ]
 
+    # ---- 按数据访问范围做跨期收入对照 ----
+
+    def compare_periods(
+        self,
+        principal: str,
+        period_a: str,
+        period_b: str,
+        template_id: int | None = None,
+        data_sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """由切片查询发起跨期对照，授权结果直接取数据范围模块。
+
+        切片查询只负责确定统计对象（查询模板/数据立方），区域能不能读、读的是
+        只读还是读写，统一交给数据范围模块按期间回查，避免两处授权口径漂移。
+        """
+        from app.services import service_for
+
+        scope_svc = service_for("olap_scope")
+        if scope_svc is None:
+            return {"ok": False, "message": "数据范围服务未就绪"}
+
+        template_name = ""
+        selected_sources = list(data_sources or [])
+        if template_id is not None:
+            template = store.find(self.MODULE, template_id)
+            if template is None:
+                return {"ok": False, "message": f"查询模板 {template_id} 不存在"}
+            template_name = str(template.get("模板名称", ""))
+            if not selected_sources:
+                selected_sources = _sources_for_template(template)
+        if not selected_sources:
+            selected_sources = list(DEFAULT_DATA_SOURCES)
+
+        try:
+            return period_compare.build_comparison(
+                principal=principal,
+                period_a=period_a,
+                period_b=period_b,
+                data_sources=selected_sources,
+                scope_service=scope_svc,
+                template_id=template_id,
+                template_name=template_name,
+            )
+        except period_compare.PeriodCompareError as error:
+            return {"ok": False, "message": str(error)}
+
+    def get_period_comparison(self, comparison_id: int) -> dict[str, Any]:
+        """回查历史对照：返回生成当时的授权快照。"""
+        record = period_compare.get_comparison(comparison_id)
+        if record is None:
+            return {"ok": False, "message": f"跨期对照 {comparison_id} 不存在"}
+        return record
+
+    def list_period_comparisons(self, principal: str | None = None) -> dict[str, Any]:
+        """列出留档的跨期对照。"""
+        return {"ok": True, "items": period_compare.list_comparisons(principal)}
+
+    def share_period_comparison(self, comparison_id: int, viewer: str) -> dict[str, Any]:
+        """按查看者实时授权生成共享视图，不放开未授权区域。"""
+        from app.services import service_for
+
+        scope_svc = service_for("olap_scope")
+        if scope_svc is None:
+            return {"ok": False, "message": "数据范围服务未就绪"}
+        view = period_compare.shared_view(comparison_id, viewer, scope_svc)
+        if view is None:
+            return {"ok": False, "message": f"跨期对照 {comparison_id} 不存在"}
+        return view
+
+    def get_comparison_grants(self, comparison_id: int) -> dict[str, Any]:
+        """汇总某次对照用到的历史授权区间，便于回查当时允许读取的数据。"""
+        from app.services import service_for
+
+        record = period_compare.get_comparison(comparison_id)
+        if record is None:
+            return {"ok": False, "message": f"跨期对照 {comparison_id} 不存在"}
+        scope_svc = service_for("olap_scope")
+        if scope_svc is None:
+            return {"ok": False, "message": "数据范围服务未就绪"}
+
+        principal = str(record.get("principal", ""))
+        grants: dict[str, list[dict[str, Any]]] = {}
+        for source in record.get("data_sources", []):
+            grants[source] = scope_svc.list_historical_grants(principal, source)
+        return {
+            "ok": True,
+            "comparison_id": comparison_id,
+            "principal": principal,
+            "periods": record.get("period_order"),
+            "data_sources": record.get("data_sources"),
+            "grants": grants,
+            "notes": "返回该分析员在各数据域上的全部历史授权区间，包含已冻结/已撤销的旧规则",
+        }
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         base["artifact"] = "查询模板数据集"
@@ -100,6 +196,22 @@ def _parse_int(val: Any, default: int) -> int:
         return int(val)
     except (ValueError, TypeError):
         return default
+
+
+# 收入由交易域提供金额、由行为域提供区域归属，两域缺一不能算可比口径。
+# 模板上用 `数据域=cube_trade,cube_user_behavior` 可以显式覆盖默认的两个域。
+def _sources_for_template(template: dict[str, Any]) -> list[str]:
+    """从查询模板推导需要校验的数据域；模板写明 `数据域=` 时优先采用。"""
+    dim_values = str(template.get("查询维值", ""))
+    for cond in dim_values.split(";"):
+        if "=" not in cond:
+            continue
+        field, value = cond.split("=", 1)
+        if field.strip() == "数据域":
+            declared = [item.strip() for item in value.split(",") if item.strip()]
+            if declared:
+                return declared
+    return list(DEFAULT_DATA_SOURCES)
 
 
 def _apply_slice_filter(
